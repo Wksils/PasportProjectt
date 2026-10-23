@@ -9,19 +9,16 @@ if "PGAPPNAME" in os.environ:
 DSN = "dbname=company_db user=my_user password=my_password host=localhost port=5433 client_encoding=UTF8 options='-c client_encoding=UTF8'"
 
 class PassportAPIHandler(BaseHTTPRequestHandler):
-    # Настраиваем CORS заголовки, чтобы React мог слать запросы
     def _set_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
-    # Обработка предварительных запросов браузера (CORS Preflight)
     def do_OPTIONS(self):
         self.send_response(200)
         self._set_cors_headers()
         self.end_headers()
 
-    # Принимаем данные от формы React
     def do_POST(self):
         if self.path == "/api/save_passport":
             content_length = int(self.headers["Content-Length"])
@@ -34,7 +31,41 @@ class PassportAPIHandler(BaseHTTPRequestHandler):
                 conn = psycopg2.connect(DSN)
                 cursor = conn.cursor()
 
-                # 1. Запись в people
+                # 1. Всегда создаем таблицы с учетом того, что паспорта может не быть
+                cursor.execute('''
+                CREATE TABLE IF NOT EXISTS people (
+                    id SERIAL PRIMARY KEY,
+                    last_name VARCHAR(100) NOT NULL,
+                    first_name VARCHAR(100) NOT NULL,
+                    middle_name VARCHAR(100),
+                    mobile_phone VARCHAR(50),
+                    home_phone VARCHAR(50),
+                    birth_date DATE NOT NULL,
+                    gender VARCHAR(10),
+                    email VARCHAR(150) UNIQUE
+                );
+                ''')
+
+                cursor.execute('''
+                CREATE TABLE IF NOT EXISTS passports (
+                    person_id INTEGER PRIMARY KEY REFERENCES people (id) ON DELETE CASCADE,
+                    passport_series VARCHAR(10),
+                    passport_number VARCHAR(10),
+                    last_name VARCHAR(100),
+                    first_name VARCHAR(100),
+                    middle_name VARCHAR(100),
+                    birth_date DATE,
+                    birth_place TEXT,
+                    issue_date DATE,
+                    department_code VARCHAR(10),
+                    issued_by TEXT,
+                    registration_address TEXT,
+                    actual_address TEXT,
+                    has_foreign_passport BOOLEAN DEFAULT FALSE
+                );
+                ''')
+
+                # 2. Запись в первую таблицу (Личные данные) - ОБЯЗАТЕЛЬНО
                 cursor.execute('''
                 INSERT INTO people (last_name, first_name, middle_name, mobile_phone, home_phone, birth_date, gender, email)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
@@ -45,31 +76,43 @@ class PassportAPIHandler(BaseHTTPRequestHandler):
                 ))
                 person_id = cursor.fetchone()[0]
 
-                # 2. Запись в passports
-                cursor.execute('''
-                INSERT INTO passports (
-                    person_id, passport_series, passport_number, last_name, first_name, middle_name, 
-                    birth_date, birth_place, issue_date, department_code, issued_by, 
-                    registration_address, actual_address, has_foreign_passport
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                ''', (
-                    person_id, data.get("passport_series"), data.get("passport_number"),
-                    data.get("last_name"), data.get("first_name"), data.get("middle_name"),
-                    data.get("birth_date"), data.get("birth_place"), data.get("issue_date"),
-                    data.get("department_code"), data.get("issued_by"),
-                    data.get("registration_address"), data.get("actual_address"),
-                    data.get("has_foreign_passport")
-                ))
+                # Проверяем, заполнил ли пользователь вторую (паспортную) часть формы
+                # Если введена серия или номер, считаем, что паспорт заполняется
+                has_passport_data = bool(data.get("passport_series") or data.get("passport_number"))
+
+                if has_passport_data:
+                    # Валидация на стороне бэкенда для безопасности
+                    if not all([data.get("passport_series"), data.get("passport_number"), data.get("birth_place"), data.get("issue_date")]):
+                        raise Exception("Заполнены не все обязательные поля паспортных данных!")
+
+                    # 3. Запись во вторую таблицу (Паспортные данные)
+                    cursor.execute('''
+                    INSERT INTO passports (
+                        person_id, passport_series, passport_number, last_name, first_name, middle_name, 
+                        birth_date, birth_place, issue_date, department_code, issued_by, 
+                        registration_address, actual_address, has_foreign_passport
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                    ''', (
+                        person_id, data.get("passport_series"), data.get("passport_number"),
+                        data.get("last_name"), data.get("first_name"), data.get("middle_name"),
+                        data.get("birth_date"), data.get("birth_place"), data.get("issue_date"),
+                        data.get("department_code"), data.get("issued_by"),
+                        data.get("registration_address"), data.get("actual_address"),
+                        data.get("has_foreign_passport", False)
+                    ))
+                    msg = f"Заявка создана успешно с паспортными данными! ID человека: {person_id}"
+                else:
+                    msg = f"Заявка создана без паспортных данных (только контакты). ID человека: {person_id}"
 
                 conn.commit()
 
-                # Отправляем успешный ответ
+                # Успешный ответ
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self._set_cors_headers()
                 self.end_headers()
-                response = {"status": "success", "message": f"ID: {person_id}"}
+                response = {"status": "success", "message": msg}
                 self.wfile.write(json.dumps(response).encode("utf-8"))
 
             except psycopg2.errors.UniqueViolation:
@@ -77,7 +120,7 @@ class PassportAPIHandler(BaseHTTPRequestHandler):
                 self._send_error_response(400, "Пользователь с таким Email уже существует!")
             except Exception as e:
                 if conn: conn.rollback()
-                self._send_error_response(500, f"Ошибка базы данных: {str(e)}")
+                self._send_error_response(500, f"Ошибка сервера: {str(e)}")
             finally:
                 if cursor: cursor.close()
                 if conn: conn.close()
@@ -93,10 +136,22 @@ class PassportAPIHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(response).encode("utf-8"))
 
 def run(server_class=HTTPServer, handler_class=PassportAPIHandler, port=8000):
-    server_address = ("localhost", port) 
+    server_address = ("0.0.0.0", port)
     httpd = server_class(server_address, handler_class)
     print(f"Сервер запущен на http://localhost:{port}")
     httpd.serve_forever()
 
 if __name__ == "__main__":
     run()
+
+
+
+# SELECT 
+#     p.id as person_id, 
+#     p.last_name, p.middle_name, p.birth_date,
+#     p.mobile_phone, p.email, p.gender, 
+#     pass.passport_series, pass.passport_number, pass.actual_address, pass.birth_place 
+# FROM people p
+# LEFT JOIN passports pass ON p.id = pass.person_id
+# WHERE p.first_name = 'Иван' 
+#   AND p.birth_date = '1990-10-10';
